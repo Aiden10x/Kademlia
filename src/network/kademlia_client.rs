@@ -1,0 +1,312 @@
+use crate::routing::routing_table::Peer;
+use crate::{routing, storage};
+use crossbeam_channel::{unbounded, Sender};
+use dashmap::DashMap;
+use num_cpus;
+use serde::{Deserialize, Serialize};
+use std::net::{SocketAddr, UdpSocket};
+use std::sync::atomic::AtomicU64;
+use std::sync::atomic::Ordering;
+use std::sync::{Arc, RwLock};
+use std::time::Duration;
+use std::{cmp, io};
+use tokio::sync::oneshot;
+
+#[derive(Debug, Serialize, Deserialize, Clone)]
+pub struct PingMessage {
+    pub id: routing::ID,
+}
+
+#[derive(Debug, Serialize, Deserialize, Clone)]
+pub struct PingResponse {
+    pub id: routing::ID,
+}
+
+#[derive(Debug, Serialize, Deserialize, Clone)]
+pub struct FindNodeMessage {
+    pub id: routing::ID,
+}
+
+#[derive(Debug, Serialize, Deserialize, Clone)]
+pub struct FindNodeResponse {
+    pub id: routing::ID,
+    pub nodes: Vec<Peer>,
+}
+
+#[derive(Debug, Serialize, Deserialize, Clone)]
+pub struct StoreMessage {
+    pub id: routing::ID,
+    pub value: Vec<u8>,
+}
+
+#[derive(Debug, Serialize, Deserialize, Clone)]
+pub struct StoreResponse {
+    success: bool,
+}
+
+#[derive(Debug, Serialize, Deserialize, Clone)]
+pub struct FindValueMessage {
+    pub id: routing::ID,
+}
+
+#[derive(Debug, Serialize, Deserialize, Clone)]
+pub struct FindValueResponse {
+    pub value: Option<Vec<u8>>,
+}
+
+#[derive(Debug, Serialize, Deserialize, Clone)]
+pub enum RpcPayload {
+    Ping(PingMessage),
+    PingResponse(PingResponse),
+    FindNode(FindNodeMessage),
+    FindNodeResponse(FindNodeResponse),
+    Store(StoreMessage),
+    StoreResponse(StoreResponse),
+    FindValue(FindValueMessage),
+    FindValueResponse(FindValueResponse),
+}
+
+#[derive(Debug, Serialize, Deserialize, Clone)]
+pub struct RpcMessage {
+    pub transaction_id: u64,
+    pub payload: RpcPayload,
+}
+
+pub struct KademliaClient {
+    sender: Sender<(RpcMessage, SocketAddr)>,
+    pending_requests: Arc<DashMap<u64, oneshot::Sender<RpcMessage>>>,
+    next_transaction_id: Arc<AtomicU64>,
+}
+
+impl KademliaClient {
+    pub fn new(bind_addr: &str, self_id: routing::ID) -> std::io::Result<Self> {
+        let routing_table = Arc::new(routing::RoutingTable::new(&self_id));
+        let storage = Arc::new(RwLock::new(storage::Storage::new()));
+        let pending_requests = Arc::new(DashMap::<u64, oneshot::Sender<RpcMessage>>::new());
+        let next_transaction_id = Arc::new(AtomicU64::new(0));
+
+        let socket = UdpSocket::bind(bind_addr)?;
+        let (sender_tx, sender_rx) = unbounded();
+        let (receiver_tx, receiver_rx) = unbounded();
+
+        // Clone sockets for threads
+        let receiver_socket = socket.try_clone()?;
+        let sender_socket = socket.try_clone()?;
+
+        // Receiver thread
+        std::thread::spawn(move || {
+            let mut buf = [0u8; 1024];
+            loop {
+                match receiver_socket.recv_from(&mut buf) {
+                    Ok((size, addr)) => {
+                        if let Ok(msg) = bincode::deserialize::<RpcMessage>(&buf[..size]) {
+                            if receiver_tx.send((msg, addr)).is_err() {
+                                break;
+                            }
+                        }
+                    }
+                    Err(e) => eprintln!("Receive error: {}", e),
+                }
+            }
+        });
+
+        // Sender thread
+        std::thread::spawn(move || loop {
+            match sender_rx.recv() {
+                Ok((msg, addr)) => {
+                    if let Ok(data) = bincode::serialize(&msg) {
+                        let _ = sender_socket.send_to(&data, addr);
+                    }
+                }
+                Err(_) => break,
+            }
+        });
+
+        // Worker threads (minus 2 for receiver and sender threads)
+        let num_workers = cmp::max(num_cpus::get() - 2, 1);
+
+        for _ in 0..num_workers {
+            let receiver = receiver_rx.clone();
+            let sender = sender_tx.clone();
+            let rt = Arc::clone(&routing_table);
+            let storage = Arc::clone(&storage);
+            let pending_requests = Arc::clone(&pending_requests);
+
+            std::thread::spawn(move || {
+                while let Ok((msg, addr)) = receiver.recv() {
+                    // Fast path: Handle responses without blocking
+                    if is_response(&msg.payload) {
+                        // Lock-free check first
+                        // TODO: make sure this doesn't block
+                        if let Some((_, tx)) = pending_requests.remove(&msg.transaction_id) {
+                            let _ = tx.send(msg.clone());
+                        }
+                    }
+
+                    if let Some(response) = handle_rpc_message(addr, msg, &rt, &storage) {
+                        let _ = sender.send((response, addr));
+                    }
+                }
+            });
+        }
+
+        Ok(Self {
+            sender: sender_tx,
+            pending_requests,
+            next_transaction_id,
+        })
+    }
+
+    pub fn send(
+        &self,
+        payload: RpcPayload,
+        addr: SocketAddr,
+    ) -> Result<u64, crossbeam_channel::SendError<(RpcMessage, SocketAddr)>> {
+        let transaction_id = self.next_transaction_id.fetch_add(1, Ordering::SeqCst);
+        let msg = RpcMessage {
+            transaction_id,
+            payload,
+        };
+        self.sender.send((msg, addr)).map(|_| transaction_id)
+    }
+
+    pub async fn send_request(
+        &self,
+        payload: RpcPayload,
+        addr: SocketAddr,
+        timeout: Duration,
+    ) -> io::Result<RpcMessage> {
+        let (tx, rx) = oneshot::channel();
+
+        let transaction_id = self.send(payload, addr).map_err(|e| {
+            io::Error::new(
+                io::ErrorKind::Other,
+                format!("Failed to send request: {}", e),
+            )
+        })?;
+
+        // Add to pending requests
+        self.pending_requests.insert(transaction_id, tx);
+
+        // Wait for the response with timeout
+        tokio::select! {
+            res = rx => res.map_err(|_| io::Error::new(io::ErrorKind::Other, "Response channel closed")),
+            _ = tokio::time::sleep(timeout) => {
+                self.pending_requests.remove(&transaction_id);
+                Err(io::Error::new(io::ErrorKind::TimedOut, "Request timed out"))
+            }
+        }
+    }
+}
+
+fn is_response(payload: &RpcPayload) -> bool {
+    matches!(
+        payload,
+        RpcPayload::PingResponse(_)
+            | RpcPayload::FindNodeResponse(_)
+            | RpcPayload::StoreResponse(_)
+            | RpcPayload::FindValueResponse(_)
+    )
+}
+
+fn handle_rpc_message(
+    addr: SocketAddr,
+    msg: RpcMessage,
+    rt: &routing::RoutingTable,
+    storage: &Arc<RwLock<storage::Storage>>,
+) -> Option<RpcMessage> {
+    match msg.payload {
+        RpcPayload::Ping(ping_message) => Some(RpcMessage {
+            transaction_id: msg.transaction_id,
+            payload: handle_ping_message(addr, ping_message, rt)
+                .map(RpcPayload::PingResponse)
+                .unwrap(),
+        }),
+        RpcPayload::PingResponse(ping_response) => {
+            handle_ping_response(addr, ping_response, rt);
+            None
+        }
+        RpcPayload::FindNode(find_node_message) => Some(RpcMessage {
+            transaction_id: msg.transaction_id,
+            payload: handle_find_node_message(addr, find_node_message, rt)
+                .map(RpcPayload::FindNodeResponse)
+                .unwrap(),
+        }),
+        RpcPayload::FindNodeResponse(find_node_response) => {
+            handle_find_node_response(addr, find_node_response, rt);
+            None
+        }
+        RpcPayload::Store(store_message) => {
+            handle_store_message(addr, store_message, storage);
+            None
+        }
+        RpcPayload::FindValue(find_value_message) => Some(RpcMessage {
+            transaction_id: msg.transaction_id,
+            payload: handle_find_value_message(addr, find_value_message, storage)
+                .map(RpcPayload::FindValueResponse)
+                .unwrap(),
+        }),
+        _ => None,
+    }
+}
+
+fn handle_ping_message(
+    addr: SocketAddr,
+    msg: PingMessage,
+    rt: &routing::RoutingTable,
+) -> Option<PingResponse> {
+    rt.add(&Peer {
+        id: msg.id.clone(),
+        address: addr.to_string(),
+    })
+    .ok()?; // TODO: Handle error
+    Some(PingResponse { id: rt.id.clone() })
+}
+
+fn handle_ping_response(addr: SocketAddr, msg: PingResponse, rt: &routing::RoutingTable) {
+    rt.add(&Peer {
+        id: msg.id.clone(),
+        address: addr.to_string(),
+    })
+    .ok(); // TODO: Handle error
+}
+
+fn handle_find_node_message(
+    addr: SocketAddr,
+    msg: FindNodeMessage,
+    rt: &routing::RoutingTable,
+) -> Option<FindNodeResponse> {
+    rt.add(&Peer {
+        id: msg.id.clone(),
+        address: addr.to_string(),
+    })
+    .ok()?; // TODO: Handle error
+    let nodes = rt.get_closest(&msg.id);
+    Some(FindNodeResponse {
+        id: rt.id.clone(),
+        nodes,
+    })
+}
+
+fn handle_find_node_response(_: SocketAddr, msg: FindNodeResponse, rt: &routing::RoutingTable) {
+    println!("Received nodes: {:?}", msg.nodes);
+    for node in msg.nodes {
+        rt.add(&node).ok(); // TODO: Handle error
+    }
+}
+
+fn handle_store_message(_: SocketAddr, msg: StoreMessage, storage: &Arc<RwLock<storage::Storage>>) {
+    // TODO: add node
+    storage.write().unwrap().set(&msg.id, msg.value);
+}
+
+fn handle_find_value_message(
+    _: SocketAddr,
+    msg: FindValueMessage,
+    storage: &Arc<RwLock<storage::Storage>>,
+) -> Option<FindValueResponse> {
+    // TODO: add node
+    Some(FindValueResponse {
+        value: storage.read().unwrap().get(&msg.id),
+    })
+}
