@@ -1,6 +1,6 @@
 use std::time::Duration;
 
-use network::kademlia_client::{FindNodeMessage, FindValueMessage, RpcPayload, StoreMessage};
+use network::kademlia_client::{FindValueMessage, RpcPayload, StoreMessage};
 
 mod network;
 mod routing;

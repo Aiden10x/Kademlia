@@ -45,7 +45,6 @@ pub struct RoutingTable {
 
 pub enum RoutingTableError {
     BucketFullError,
-    ExistingIdError,
 }
 
 impl RoutingTable {
@@ -60,30 +59,44 @@ impl RoutingTable {
 
     pub fn add(&self, peer: &Peer) -> Result<(), RoutingTableError> {
         let self_id = &self.id.clone();
-        // TODO: block adding self
+
+        if peer.id == *self_id {
+            return Ok(());
+        }
+
         return self.traverse_mut(
             &peer.id,
             &mut |node_guard, depth, can_split, distance_bits| {
                 // Check if the contact already exists.
-                if node_guard
+                let existing_index = node_guard
                     .peers
                     .as_ref()
                     .unwrap()
                     .iter()
-                    .any(|x| x.id == peer.id)
-                {
-                    return Err(RoutingTableError::ExistingIdError);
+                    .position(|x| x.id == peer.id);
+                if existing_index.is_some() {
+                    // Move to the front
+                    let peer = node_guard.peers.as_ref().unwrap()[existing_index.unwrap()].clone();
+                    node_guard
+                        .peers
+                        .as_mut()
+                        .unwrap()
+                        .remove(existing_index.unwrap());
+                    node_guard.peers.as_mut().unwrap().insert(0, peer);
+                    return Ok(());
                 }
 
                 // If the leaf node has less than K contacts, add the contact
                 if node_guard.peers.as_mut().unwrap().len() < super::K {
                     println!("Adding {:?} to bucket", peer.id);
-                    node_guard.peers.as_mut().unwrap().push(peer.clone());
+                    node_guard.peers.as_mut().unwrap().insert(0, peer.clone());
                     return Ok(());
                 }
 
-                // If the bucket is full and can't be split (is a right bucket), return
+                // If the bucket is full and can't be split, evict the contact at the end
                 if !can_split {
+                    node_guard.peers.as_mut().unwrap().pop();
+                    node_guard.peers.as_mut().unwrap().insert(0, peer.clone());
                     return Err(RoutingTableError::BucketFullError);
                 }
 
@@ -108,9 +121,9 @@ impl RoutingTable {
 
                 // Add the new contact to the correct node
                 if distance_bits[depth] {
-                    new_right.peers.as_mut().unwrap().push(peer.clone());
+                    new_right.peers.as_mut().unwrap().insert(0, peer.clone());
                 } else {
-                    new_left.peers.as_mut().unwrap().push(peer.clone());
+                    new_left.peers.as_mut().unwrap().insert(0, peer.clone());
                 }
 
                 // Update the leaf node to be a parent node
@@ -158,6 +171,7 @@ impl RoutingTable {
         );
     }
 
+    // TODO: modify to closest K
     pub fn get_closest(&self, id: &ID) -> Vec<Peer> {
         self.traverse(
             id,

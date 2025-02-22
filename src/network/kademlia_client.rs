@@ -41,6 +41,7 @@ pub struct StoreMessage {
 
 #[derive(Debug, Serialize, Deserialize, Clone)]
 pub struct StoreResponse {
+    pub id: routing::ID,
     success: bool,
 }
 
@@ -51,6 +52,7 @@ pub struct FindValueMessage {
 
 #[derive(Debug, Serialize, Deserialize, Clone)]
 pub struct FindValueResponse {
+    pub id: routing::ID,
     pub value: Option<Vec<u8>>,
 }
 
@@ -76,6 +78,7 @@ pub struct KademliaClient {
     sender: Sender<(RpcMessage, SocketAddr)>,
     pending_requests: Arc<DashMap<u64, oneshot::Sender<RpcMessage>>>,
     next_transaction_id: Arc<AtomicU64>,
+    routing_table: Arc<routing::RoutingTable>,
 }
 
 impl KademliaClient {
@@ -154,6 +157,7 @@ impl KademliaClient {
             sender: sender_tx,
             pending_requests,
             next_transaction_id,
+            routing_table,
         })
     }
 
@@ -199,16 +203,6 @@ impl KademliaClient {
     }
 }
 
-fn is_response(payload: &RpcPayload) -> bool {
-    matches!(
-        payload,
-        RpcPayload::PingResponse(_)
-            | RpcPayload::FindNodeResponse(_)
-            | RpcPayload::StoreResponse(_)
-            | RpcPayload::FindValueResponse(_)
-    )
-}
-
 fn handle_rpc_message(
     addr: SocketAddr,
     msg: RpcMessage,
@@ -236,18 +230,29 @@ fn handle_rpc_message(
             handle_find_node_response(addr, find_node_response, rt);
             None
         }
-        RpcPayload::Store(store_message) => {
-            handle_store_message(addr, store_message, storage);
-            None
-        }
+        RpcPayload::Store(store_message) => handle_store_message(addr, store_message, rt, storage)
+            .map(|store_response| RpcMessage {
+                transaction_id: msg.transaction_id,
+                payload: RpcPayload::StoreResponse(store_response),
+            }),
         RpcPayload::FindValue(find_value_message) => Some(RpcMessage {
             transaction_id: msg.transaction_id,
-            payload: handle_find_value_message(addr, find_value_message, storage)
+            payload: handle_find_value_message(addr, find_value_message, rt, storage)
                 .map(RpcPayload::FindValueResponse)
                 .unwrap(),
         }),
         _ => None,
     }
+}
+
+fn is_response(payload: &RpcPayload) -> bool {
+    matches!(
+        payload,
+        RpcPayload::PingResponse(_)
+            | RpcPayload::FindNodeResponse(_)
+            | RpcPayload::StoreResponse(_)
+            | RpcPayload::FindValueResponse(_)
+    )
 }
 
 fn handle_ping_message(
@@ -259,7 +264,7 @@ fn handle_ping_message(
         id: msg.id.clone(),
         address: addr.to_string(),
     })
-    .ok()?; // TODO: Handle error
+    .ok(); // TODO: Handle error
     Some(PingResponse { id: rt.id.clone() })
 }
 
@@ -280,7 +285,7 @@ fn handle_find_node_message(
         id: msg.id.clone(),
         address: addr.to_string(),
     })
-    .ok()?; // TODO: Handle error
+    .ok(); // TODO: Handle error
     let nodes = rt.get_closest(&msg.id);
     Some(FindNodeResponse {
         id: rt.id.clone(),
@@ -289,24 +294,47 @@ fn handle_find_node_message(
 }
 
 fn handle_find_node_response(_: SocketAddr, msg: FindNodeResponse, rt: &routing::RoutingTable) {
-    println!("Received nodes: {:?}", msg.nodes);
     for node in msg.nodes {
         rt.add(&node).ok(); // TODO: Handle error
     }
 }
 
-fn handle_store_message(_: SocketAddr, msg: StoreMessage, storage: &Arc<RwLock<storage::Storage>>) {
-    // TODO: add node
-    storage.write().unwrap().set(&msg.id, msg.value);
+fn handle_store_message(
+    addr: SocketAddr,
+    msg: StoreMessage,
+    rt: &routing::RoutingTable,
+    storage: &Arc<RwLock<storage::Storage>>,
+) -> Option<StoreResponse> {
+    rt.add(&Peer {
+        id: msg.id.clone(),
+        address: addr.to_string(),
+    })
+    .ok(); // TODO: Handle error
+    match storage.write().unwrap().set(&msg.id, msg.value) {
+        Ok(_) => Some(StoreResponse {
+            id: rt.id.clone(),
+            success: true,
+        }),
+        Err(_) => Some(StoreResponse {
+            id: rt.id.clone(),
+            success: false,
+        }),
+    }
 }
 
 fn handle_find_value_message(
-    _: SocketAddr,
+    addr: SocketAddr,
     msg: FindValueMessage,
+    rt: &routing::RoutingTable,
     storage: &Arc<RwLock<storage::Storage>>,
 ) -> Option<FindValueResponse> {
-    // TODO: add node
+    rt.add(&Peer {
+        id: msg.id.clone(),
+        address: addr.to_string(),
+    })
+    .ok(); // TODO: Handle error
     Some(FindValueResponse {
+        id: rt.id.clone(),
         value: storage.read().unwrap().get(&msg.id),
     })
 }

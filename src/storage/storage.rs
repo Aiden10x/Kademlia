@@ -6,6 +6,7 @@ pub struct Storage {
     pub path: String,
 }
 
+// TODO: multithread
 impl Storage {
     pub fn new() -> Self {
         Storage {
@@ -25,9 +26,10 @@ impl Storage {
         }
     }
 
-    pub fn set(&mut self, key: &ID, value: Vec<u8>) {
+    // TODO: wrap this error
+    pub fn set(&mut self, key: &ID, value: Vec<u8>) -> Result<(), rocksdb::Error> {
         let db = DB::open_default(&self.path).unwrap();
-        db.put(key.value.to_bytes_be(), value).unwrap();
+        db.put(key.value.to_bytes_be(), value)
     }
 
     pub fn remove(&mut self, key: &ID) {
