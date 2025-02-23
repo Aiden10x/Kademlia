@@ -54,6 +54,7 @@ pub struct FindValueMessage {
 pub struct FindValueResponse {
     pub id: routing::ID,
     pub value: Option<Vec<u8>>,
+    pub nodes: Option<Vec<Peer>>,
 }
 
 #[derive(Debug, Serialize, Deserialize, Clone)]
@@ -235,12 +236,20 @@ fn handle_rpc_message(
                 transaction_id: msg.transaction_id,
                 payload: RpcPayload::StoreResponse(store_response),
             }),
+        RpcPayload::StoreResponse(store_response) => {
+            handle_store_response(addr, store_response, rt);
+            None
+        }
         RpcPayload::FindValue(find_value_message) => Some(RpcMessage {
             transaction_id: msg.transaction_id,
             payload: handle_find_value_message(addr, find_value_message, rt, storage)
                 .map(RpcPayload::FindValueResponse)
                 .unwrap(),
         }),
+        RpcPayload::FindValueResponse(find_value_response) => {
+            handel_find_value_response(addr, find_value_response, rt);
+            None
+        }
         _ => None,
     }
 }
@@ -322,6 +331,14 @@ fn handle_store_message(
     }
 }
 
+fn handle_store_response(addr: SocketAddr, msg: StoreResponse, rt: &routing::RoutingTable) {
+    rt.add(&Peer {
+        id: msg.id.clone(),
+        address: addr.to_string(),
+    })
+    .ok(); // TODO: Handle error
+}
+
 fn handle_find_value_message(
     addr: SocketAddr,
     msg: FindValueMessage,
@@ -333,8 +350,22 @@ fn handle_find_value_message(
         address: addr.to_string(),
     })
     .ok(); // TODO: Handle error
+    let value = storage.read().unwrap().get(&msg.id);
+    let nodes = match value {
+        Some(_) => None,
+        None => Some(rt.get_closest_k(&msg.id)),
+    };
     Some(FindValueResponse {
         id: rt.id.clone(),
-        value: storage.read().unwrap().get(&msg.id),
+        value: value,
+        nodes,
     })
+}
+
+fn handel_find_value_response(_: SocketAddr, msg: FindValueResponse, rt: &routing::RoutingTable) {
+    if let Some(nodes) = msg.nodes {
+        for node in nodes {
+            rt.add(&node).ok(); // TODO: Handle error
+        }
+    }
 }
