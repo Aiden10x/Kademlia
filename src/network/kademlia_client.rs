@@ -5,6 +5,7 @@ use dashmap::DashMap;
 use futures::future;
 use num_cpus;
 use serde::{Deserialize, Serialize};
+use std::collections::HashSet;
 use std::net::{SocketAddr, UdpSocket};
 use std::sync::atomic::AtomicU64;
 use std::sync::atomic::Ordering;
@@ -26,6 +27,7 @@ pub struct PingResponse {
 #[derive(Debug, Serialize, Deserialize, Clone)]
 pub struct FindNodeMessage {
     pub id: routing::ID,
+    pub key: routing::ID,
 }
 
 #[derive(Debug, Serialize, Deserialize, Clone)]
@@ -37,6 +39,7 @@ pub struct FindNodeResponse {
 #[derive(Debug, Serialize, Deserialize, Clone)]
 pub struct StoreMessage {
     pub id: routing::ID,
+    pub key: routing::ID,
     pub value: Vec<u8>,
 }
 
@@ -49,6 +52,7 @@ pub struct StoreResponse {
 #[derive(Debug, Serialize, Deserialize, Clone)]
 pub struct FindValueMessage {
     pub id: routing::ID,
+    pub key: routing::ID,
 }
 
 #[derive(Debug, Serialize, Deserialize, Clone)]
@@ -81,6 +85,8 @@ pub struct KademliaClient {
     pending_requests: Arc<DashMap<u64, oneshot::Sender<RpcMessage>>>,
     next_transaction_id: Arc<AtomicU64>,
     routing_table: Arc<routing::RoutingTable>,
+    storage: Arc<RwLock<storage::Storage>>,
+    pub handles: Vec<std::thread::JoinHandle<()>>,
 }
 
 impl KademliaClient {
@@ -98,6 +104,8 @@ impl KademliaClient {
         let receiver_socket = socket.try_clone()?;
         let sender_socket = socket.try_clone()?;
 
+        let mut handles: Vec<std::thread::JoinHandle<()>> = Vec::new();
+
         // Receiver thread
         let receiver = std::thread::spawn(move || {
             let mut buf = [0u8; 1024];
@@ -105,6 +113,7 @@ impl KademliaClient {
                 match receiver_socket.recv_from(&mut buf) {
                     Ok((size, addr)) => {
                         if let Ok(msg) = bincode::deserialize::<RpcMessage>(&buf[..size]) {
+                            println!("Received message: {:?}", msg);
                             if receiver_tx.send((msg, addr)).is_err() {
                                 break;
                             }
@@ -114,11 +123,13 @@ impl KademliaClient {
                 }
             }
         });
+        handles.push(receiver);
 
         // Sender thread
         let sender = std::thread::spawn(move || loop {
             match sender_rx.recv() {
                 Ok((msg, addr)) => {
+                    println!("Sending message: {:?}", msg);
                     if let Ok(data) = bincode::serialize(&msg) {
                         let _ = sender_socket.send_to(&data, addr);
                     }
@@ -126,6 +137,7 @@ impl KademliaClient {
                 Err(_) => break,
             }
         });
+        handles.push(sender);
 
         // Worker threads (minus 2 for receiver and sender threads)
         let num_workers = cmp::max(num_cpus::get() - 2, 1);
@@ -137,7 +149,7 @@ impl KademliaClient {
             let storage = Arc::clone(&storage);
             let pending_requests = Arc::clone(&pending_requests);
 
-            std::thread::spawn(move || {
+            let handle = std::thread::spawn(move || {
                 while let Ok((msg, addr)) = receiver.recv() {
                     // Fast path: Handle responses without blocking
                     if is_response(&msg.payload) {
@@ -153,6 +165,7 @@ impl KademliaClient {
                     }
                 }
             });
+            handles.push(handle);
         }
 
         Ok(Self {
@@ -160,6 +173,8 @@ impl KademliaClient {
             pending_requests,
             next_transaction_id,
             routing_table,
+            storage,
+            handles,
         })
     }
 
@@ -206,30 +221,32 @@ impl KademliaClient {
 
     pub async fn bootstrap(&self, known_hosts: Vec<SocketAddr>) {
         // Ping all known hosts
-        futures::future::join_all(
-            known_hosts
-                .iter()
-                .map(|addr| async {
-                    self.send_request(
-                        RpcPayload::Ping(PingMessage {
-                            id: self.routing_table.id.clone(),
-                        }),
-                        *addr,
-                        Duration::from_secs(1),
-                    )
-                })
-                .collect::<Vec<_>>(),
-        )
-        .await;
+        let reqs = known_hosts
+            .iter()
+            .map(|addr| {
+                self.send_request(
+                    RpcPayload::Ping(PingMessage {
+                        id: self.routing_table.id.clone(),
+                    }),
+                    *addr,
+                    Duration::from_secs(1),
+                )
+            })
+            .collect::<Vec<_>>();
+        future::join_all(reqs).await;
         // Self lookup
         let _ = self.lookup(&self.routing_table.id).await;
     }
 
     pub async fn store(&self, key: routing::ID, value: Vec<u8>) -> bool {
+        // Store locally
+        self.storage.write().unwrap().set(&key, value.clone()).ok();
+
         let nodes = self.lookup(&key).await;
         let payload = RpcPayload::Store(StoreMessage {
-            id: key.clone(),
+            key: key.clone(),
             value: value.clone(),
+            id: self.routing_table.id.clone(),
         });
 
         let futures = nodes.iter().map(|node| {
@@ -258,8 +275,16 @@ impl KademliaClient {
     }
 
     pub async fn get(&self, key: routing::ID) -> Option<Vec<u8>> {
+        // Check locally
+        if let Some(value) = self.storage.read().unwrap().get(&key) {
+            return Some(value);
+        }
+
         let nodes = self.lookup(&key).await;
-        let payload = RpcPayload::FindValue(FindValueMessage { id: key.clone() });
+        let payload = RpcPayload::FindValue(FindValueMessage {
+            key: key.clone(),
+            id: self.routing_table.id.clone(),
+        });
 
         let futures = nodes.iter().map(|node| {
             self.send_request(
@@ -320,7 +345,8 @@ impl KademliaClient {
         let futures = candidates.iter().map(|node| {
             return self.send_request(
                 RpcPayload::FindNode(FindNodeMessage {
-                    id: node.id.clone(),
+                    key: target_id.clone(),
+                    id: self.routing_table.id.clone(),
                 }),
                 node.address.parse().unwrap(),
                 Duration::from_secs(1),
@@ -339,9 +365,22 @@ impl KademliaClient {
                         all_nodes.extend(find_node_response.nodes);
                     }
                 }
-                Err(e) => (),
+                Err(_) => (),
             }
         }
+
+        all_nodes = all_nodes
+            .into_iter()
+            .filter(|node| node.id != self.routing_table.id)
+            .collect::<HashSet<Peer>>()
+            .into_iter()
+            .collect();
+
+        all_nodes.sort_by(|a, b| {
+            a.id.distance(target_id)
+                .value
+                .cmp(&b.id.distance(target_id).value)
+        });
 
         return Box::pin(self.lookup_recursive(target_id, all_nodes, queried)).await;
     }
@@ -434,7 +473,7 @@ fn handle_find_node_message(
     rt: &routing::RoutingTable,
 ) -> Option<FindNodeResponse> {
     rt.add(&Peer {
-        id: msg.id.clone(),
+        id: msg.id.clone(), // TODO: this is bug
         address: addr.to_string(),
     })
     .ok(); // TODO: Handle error

@@ -57,6 +57,7 @@ impl RoutingTable {
         }
     }
 
+    // TODO: return if in the same bucket so we can propagate data
     pub fn add(&self, peer: &Peer) -> Result<(), RoutingTableError> {
         let self_id = &self.id.clone();
 
@@ -88,6 +89,7 @@ impl RoutingTable {
 
                 // If the leaf node has less than K contacts, add the contact
                 if node_guard.peers.as_mut().unwrap().len() < super::K {
+                    println!("New peer {:?}", peer);
                     node_guard.peers.as_mut().unwrap().insert(0, peer.clone());
                     return Ok(());
                 }
@@ -138,38 +140,6 @@ impl RoutingTable {
         );
     }
 
-    pub fn has(&self, id: &ID) -> bool {
-        self.traverse(
-            id,
-            &mut |node_guard, _, _, _| {
-                node_guard
-                    .peers
-                    .as_ref()
-                    .unwrap()
-                    .iter()
-                    .any(|x| x.id == *id)
-            },
-            None,
-            None,
-            None,
-        )
-    }
-
-    pub fn remove(&mut self, id: &ID) {
-        self.traverse_mut(
-            id,
-            &mut |node_guard, _, _, _| {
-                let peers = node_guard.peers.as_mut().unwrap();
-                if let Some(index) = peers.iter().position(|x| x.id == *id) {
-                    peers.remove(index);
-                }
-            },
-            None,
-            None,
-            None,
-        );
-    }
-
     pub fn get_closest(&self, id: &ID) -> (Vec<Peer>, usize) {
         self.traverse(
             id,
@@ -195,16 +165,6 @@ impl RoutingTable {
         }
         closest.truncate(super::K);
         closest
-    }
-
-    pub fn get_contacts(&self, id: &ID) -> Vec<Peer> {
-        self.traverse(
-            id,
-            &mut |node_guard, _, _, _| node_guard.peers.as_ref().unwrap().clone(),
-            None,
-            None,
-            None,
-        )
     }
 
     fn traverse_mut<T>(
@@ -324,44 +284,6 @@ mod tests {
         });
         // Make sure the bucket was split
         assert_eq!(routing_table.root.read().unwrap().peers, None);
-    }
-
-    #[test]
-    fn test_has() {
-        let id = ID::zero();
-        let mut routing_table = RoutingTable::new(&id);
-        for _ in 0..1000 {
-            routing_table.add(&Peer {
-                id: ID::random_id(),
-                address: "".to_owned(),
-            });
-        }
-        let new_id = ID::random_id();
-        routing_table.add(&Peer {
-            id: new_id.clone(),
-            address: "".to_owned(),
-        });
-        assert!(routing_table.has(&new_id));
-    }
-
-    #[test]
-    fn test_remove() {
-        let id = ID::zero();
-        let mut routing_table = RoutingTable::new(&id);
-        for _ in 0..20 {
-            routing_table.add(&Peer {
-                id: ID::random_id(),
-                address: "".to_owned(),
-            });
-        }
-        let new_id = ID::random_id();
-        routing_table.add(&Peer {
-            id: new_id.clone(),
-            address: "".to_owned(),
-        });
-        assert!(routing_table.has(&new_id));
-        routing_table.remove(&new_id);
-        assert!(!routing_table.has(&new_id));
     }
 
     #[test]

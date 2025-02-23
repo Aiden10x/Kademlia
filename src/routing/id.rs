@@ -1,6 +1,7 @@
 // src/routing/id.rs
 use num_bigint::BigUint;
 use serde::{Deserialize, Serialize};
+use sha2::Digest;
 use std::hash::{Hash, Hasher}; // Add this line
 
 /// The ID struct represents the identifier used in the Kademlia protocol.
@@ -84,6 +85,11 @@ impl ID {
         ID {
             value: BigUint::from(data),
         }
+    }
+
+    pub fn from_sha_256(data: &[u8]) -> Self {
+        let hash = sha2::Sha256::digest(data);
+        ID::from_bytes(&hash).unwrap()
     }
 
     pub fn random_id() -> Self {
