@@ -17,7 +17,7 @@ use crate::routing::ID;
 /// - Performing lookup operations to locate nodes responsible for specific IDs in the network.
 /// - Implementing utility methods for splitting buckets, calculating bucket indexes, and other internal operations.
 ///
-#[derive(Debug, Serialize, Deserialize, Clone, PartialEq)]
+#[derive(Debug, Serialize, Deserialize, Clone, PartialEq, Eq, Hash)]
 pub struct Peer {
     pub id: ID,
     pub address: String,
@@ -390,5 +390,20 @@ mod tests {
             assert!(last_distance.value <= distance.value);
             last_distance = distance;
         }
+    }
+
+    #[test]
+    fn tesst_get_closest_K() {
+        let id = ID::zero();
+        let routing_table = RoutingTable::new(&id);
+        for _ in 0..30 {
+            routing_table.add(&Peer {
+                id: ID::random_id(),
+                address: "".to_owned(),
+            });
+        }
+        let new_id = ID::random_id();
+        let closest = routing_table.get_closest_k(&new_id);
+        assert_eq!(closest.len(), 20);
     }
 }

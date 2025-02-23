@@ -18,14 +18,7 @@ async fn main() {
 
     let client = network::KademliaClient::new(self_address, self_id.clone()).unwrap();
     let save_resp = client
-        .send_request(
-            RpcPayload::Store(StoreMessage {
-                id: storage_id.clone(),
-                value: "Hello, world!".as_bytes().to_vec(),
-            }),
-            "127.0.0.1:8080".parse().unwrap(),
-            Duration::from_secs(1),
-        )
+        .store(storage_id.clone(), "Hello, world!".as_bytes().to_vec())
         .await;
     println!("Save response: {:?}", save_resp);
 

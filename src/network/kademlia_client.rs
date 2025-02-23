@@ -2,6 +2,7 @@ use crate::routing::routing_table::Peer;
 use crate::{routing, storage};
 use crossbeam_channel::{unbounded, Sender};
 use dashmap::DashMap;
+use futures::future;
 use num_cpus;
 use serde::{Deserialize, Serialize};
 use std::net::{SocketAddr, UdpSocket};
@@ -98,7 +99,7 @@ impl KademliaClient {
         let sender_socket = socket.try_clone()?;
 
         // Receiver thread
-        std::thread::spawn(move || {
+        let receiver = std::thread::spawn(move || {
             let mut buf = [0u8; 1024];
             loop {
                 match receiver_socket.recv_from(&mut buf) {
@@ -115,7 +116,7 @@ impl KademliaClient {
         });
 
         // Sender thread
-        std::thread::spawn(move || loop {
+        let sender = std::thread::spawn(move || loop {
             match sender_rx.recv() {
                 Ok((msg, addr)) => {
                     if let Ok(data) = bincode::serialize(&msg) {
@@ -201,6 +202,127 @@ impl KademliaClient {
                 Err(io::Error::new(io::ErrorKind::TimedOut, "Request timed out"))
             }
         }
+    }
+
+    pub async fn store(&self, key: routing::ID, value: Vec<u8>) -> bool {
+        let nodes = self.lookup(&key).await;
+        let payload = RpcPayload::Store(StoreMessage {
+            id: key.clone(),
+            value: value.clone(),
+        });
+
+        let futures = nodes.iter().map(|node| {
+            self.send_request(
+                payload.clone(),
+                node.address.parse().unwrap(),
+                Duration::from_secs(1),
+            )
+        });
+
+        let responses = future::join_all(futures).await;
+        for response in responses {
+            match response {
+                Ok(msg) => {
+                    if let RpcPayload::StoreResponse(store_response) = msg.payload {
+                        if store_response.success {
+                            return true;
+                        }
+                    }
+                }
+                Err(e) => (),
+            }
+        }
+
+        return false;
+    }
+
+    pub async fn get(&self, key: routing::ID) -> Option<Vec<u8>> {
+        let nodes = self.lookup(&key).await;
+        let payload = RpcPayload::FindValue(FindValueMessage { id: key.clone() });
+
+        let futures = nodes.iter().map(|node| {
+            self.send_request(
+                payload.clone(),
+                node.address.parse().unwrap(),
+                Duration::from_secs(1),
+            )
+        });
+
+        let responses = future::join_all(futures).await;
+        for response in responses {
+            match response {
+                Ok(msg) => {
+                    if let RpcPayload::FindValueResponse(find_value_response) = msg.payload {
+                        if let Some(value) = find_value_response.value {
+                            return Some(value);
+                        }
+                    }
+                }
+                Err(e) => (),
+            }
+        }
+
+        return None;
+    }
+
+    async fn lookup(&self, target_id: &routing::ID) -> Vec<Peer> {
+        let all_nodes = self.routing_table.get_closest_k(&target_id);
+        let queried: std::collections::HashSet<Peer> = std::collections::HashSet::new();
+        return self.lookup_recursive(target_id, all_nodes, queried).await;
+    }
+
+    async fn lookup_recursive(
+        &self,
+        target_id: &routing::ID,
+        mut all_nodes: Vec<Peer>,
+        mut queried: std::collections::HashSet<Peer>,
+    ) -> Vec<Peer> {
+        // Sort nodes by distance to the TARGET ID
+        all_nodes.sort_by(|a, b| {
+            a.id.distance(target_id)
+                .value
+                .cmp(&b.id.distance(target_id).value)
+        });
+
+        let candidates = all_nodes
+            .iter()
+            .filter(|node| !queried.contains(node))
+            .take(super::ALPHA)
+            .cloned()
+            .collect::<Vec<Peer>>();
+
+        if candidates.is_empty() {
+            // Return at max K closest nodes
+            return all_nodes[0..cmp::min(routing::K, all_nodes.len())].to_vec();
+        }
+
+        let futures = candidates.iter().map(|node| {
+            return self.send_request(
+                RpcPayload::FindNode(FindNodeMessage {
+                    id: node.id.clone(),
+                }),
+                node.address.parse().unwrap(),
+                Duration::from_secs(1),
+            );
+        });
+
+        let responses = futures::future::join_all(futures).await;
+        for node in candidates {
+            queried.insert(node);
+        }
+
+        for response in responses {
+            match response {
+                Ok(msg) => {
+                    if let RpcPayload::FindNodeResponse(find_node_response) = msg.payload {
+                        all_nodes.extend(find_node_response.nodes);
+                    }
+                }
+                Err(e) => (),
+            }
+        }
+
+        return Box::pin(self.lookup_recursive(target_id, all_nodes, queried)).await;
     }
 }
 
