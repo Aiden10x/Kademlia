@@ -204,6 +204,27 @@ impl KademliaClient {
         }
     }
 
+    pub async fn bootstrap(&self, known_hosts: Vec<SocketAddr>) {
+        // Ping all known hosts
+        futures::future::join_all(
+            known_hosts
+                .iter()
+                .map(|addr| async {
+                    self.send_request(
+                        RpcPayload::Ping(PingMessage {
+                            id: self.routing_table.id.clone(),
+                        }),
+                        *addr,
+                        Duration::from_secs(1),
+                    )
+                })
+                .collect::<Vec<_>>(),
+        )
+        .await;
+        // Self lookup
+        let _ = self.lookup(&self.routing_table.id).await;
+    }
+
     pub async fn store(&self, key: routing::ID, value: Vec<u8>) -> bool {
         let nodes = self.lookup(&key).await;
         let payload = RpcPayload::Store(StoreMessage {
@@ -229,7 +250,7 @@ impl KademliaClient {
                         }
                     }
                 }
-                Err(e) => (),
+                Err(_) => (),
             }
         }
 
@@ -258,7 +279,7 @@ impl KademliaClient {
                         }
                     }
                 }
-                Err(e) => (),
+                Err(_) => (),
             }
         }
 
