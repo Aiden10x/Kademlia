@@ -286,7 +286,7 @@ fn handle_find_node_message(
         address: addr.to_string(),
     })
     .ok(); // TODO: Handle error
-    let nodes = rt.get_closest(&msg.id);
+    let nodes = rt.get_closest_k(&msg.id);
     Some(FindNodeResponse {
         id: rt.id.clone(),
         nodes,

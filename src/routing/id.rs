@@ -169,6 +169,12 @@ impl ID {
         let xor_result = &self.value ^ &other.value;
         ID { value: xor_result }
     }
+
+    pub fn flip_bit(&self, bit: usize) -> ID {
+        let operand = BigUint::from(1_u32) << bit;
+        let flipped = &self.value ^ &operand;
+        ID { value: flipped }
+    }
 }
 
 #[cfg(test)]

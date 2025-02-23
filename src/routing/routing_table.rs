@@ -88,7 +88,6 @@ impl RoutingTable {
 
                 // If the leaf node has less than K contacts, add the contact
                 if node_guard.peers.as_mut().unwrap().len() < super::K {
-                    println!("Adding {:?} to bucket", peer.id);
                     node_guard.peers.as_mut().unwrap().insert(0, peer.clone());
                     return Ok(());
                 }
@@ -171,20 +170,31 @@ impl RoutingTable {
         );
     }
 
-    // TODO: modify to closest K
-    pub fn get_closest(&self, id: &ID) -> Vec<Peer> {
+    pub fn get_closest(&self, id: &ID) -> (Vec<Peer>, usize) {
         self.traverse(
             id,
-            &mut |node_guard, _, _, _| {
+            &mut |node_guard, depth, _, _| {
                 let mut sorted_peers = node_guard.peers.as_ref().unwrap().clone();
                 sorted_peers
                     .sort_by(|a, b| id.distance(&a.id).value.cmp(&id.distance(&b.id).value));
-                sorted_peers
+                (sorted_peers, depth)
             },
             None,
             None,
             None,
         )
+    }
+
+    // TODO: verify this function
+    pub fn get_closest_k(&self, id: &ID) -> Vec<Peer> {
+        let (mut closest, depth) = self.get_closest(id).clone();
+        while closest.len() < super::K && depth > 0 {
+            let new_id = id.flip_bit(depth);
+            let (new_closest, _) = self.get_closest(&new_id);
+            closest.extend(new_closest);
+        }
+        closest.truncate(super::K);
+        closest
     }
 
     pub fn get_contacts(&self, id: &ID) -> Vec<Peer> {
@@ -282,7 +292,7 @@ mod tests {
     #[test]
     fn test_add() {
         let id = ID::zero();
-        let mut routing_table = RoutingTable::new(&id);
+        let routing_table = RoutingTable::new(&id);
         let new_id = ID::random_id();
         routing_table.add(&Peer {
             id: new_id.clone(),
@@ -320,7 +330,7 @@ mod tests {
     fn test_has() {
         let id = ID::zero();
         let mut routing_table = RoutingTable::new(&id);
-        for _ in 0..20 {
+        for _ in 0..1000 {
             routing_table.add(&Peer {
                 id: ID::random_id(),
                 address: "".to_owned(),
@@ -371,6 +381,7 @@ mod tests {
         });
         let mut distances = routing_table
             .get_closest(&new_id)
+            .0
             .into_iter()
             .map(|peer| peer.id.distance(&new_id));
 
